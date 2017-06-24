@@ -273,20 +273,24 @@ class Compiler:
 
     def visit_Name(self, node):
         # Only supports locals, not globals
-        self.asm.instr('pushq', '{}(%rbp)'.format(self.local_offset(node.id)))
+        offset = self.local_offset(node.id)
+        self.asm.instr('pushq', '{}(%rbp)'.format(offset))
 
     def visit_Assign(self, node):
         # Only supports assignment of (a single) local variable
-        assert len(node.targets) == 1, 'can only assign one variable at a time'
+        assert len(node.targets) == 1, \
+            'can only assign one variable at a time'
         self.visit(node.value)
-        self.asm.instr('popq', '{}(%rbp)'.format(self.local_offset(node.targets[0].id)))
+        offset = self.local_offset(node.targets[0].id)
+        self.asm.instr('popq', '{}(%rbp)'.format(offset))
 
     def visit_AugAssign(self, node):
         # Handles "n += 1" and the like
         self.visit(node.target)
         self.visit(node.value)
         self.visit(node.op)
-        self.asm.instr('popq', '{}(%rbp)'.format(self.local_offset(node.target.id)))
+        offset = self.local_offset(node.target.id)
+        self.asm.instr('popq', '{}(%rbp)'.format(offset))
 
     def simple_binop(self, op):
         self.asm.instr('popq', '%rdx')
@@ -452,7 +456,8 @@ class Compiler:
         #   while i < stop:
         #       body
         #       i = i + step
-        assert isinstance(node.iter, ast.Call) and node.iter.func.id == 'range', \
+        assert isinstance(node.iter, ast.Call) and \
+            node.iter.func.id == 'range', \
             'for can only be used with range()'
         range_args = node.iter.args
         if len(range_args) == 1:
@@ -464,7 +469,8 @@ class Compiler:
             step = ast.Num(n=1)
         else:
             start, stop, step = range_args
-            if (isinstance(step, ast.UnaryOp) and isinstance(step.op, ast.USub) and
+            if (isinstance(step, ast.UnaryOp) and
+                    isinstance(step.op, ast.USub) and
                     isinstance(step.operand, ast.Num)):
                 # Handle negative step
                 step = ast.Num(n=-step.operand.n)
