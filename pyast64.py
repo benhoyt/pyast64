@@ -152,6 +152,8 @@ class Compiler:
         self.footer()
 
     def visit(self, node):
+        # We could have subclassed ast.NodeVisitor, but it's better to fail
+        # hard on AST nodes we don't support
         name = node.__class__.__name__
         visit_func = getattr(self, 'visit_' + name, None)
         assert visit_func is not None, '{} not supported'.format(name)
@@ -166,6 +168,7 @@ class Compiler:
         self.asm.flush()
 
     def compile_putc(self):
+        # Insert this into every program so it can call putc() for output
         self.asm.label('putc')
         self.compile_enter()
         self.asm.instr('movl', '$0x2000004', '%eax')    # write
@@ -185,10 +188,12 @@ class Compiler:
         assert node.args.vararg is None, '*args not supported'
         assert not node.args.kwonlyargs, 'keyword-only args not supported'
         assert not node.args.kwarg, 'keyword args not supported'
+
         self.func = node.name
         self.label_num = 1
         self.locals = {a.arg: i for i, a in enumerate(node.args.args)}
 
+        # Find names of additional locals assigned in this function
         locals_visitor = LocalsVisitor()
         locals_visitor.visit(node)
         for name in locals_visitor.local_names:
@@ -196,20 +201,22 @@ class Compiler:
                 self.locals[name] = len(self.locals) + 1
         self.break_labels = []
 
-        self.asm.comment('{} locals: {}'.format(self.func, self.locals))
-
+        # Function label and header
         if node.name == 'main':
             self.asm.directive('.globl _main')
             self.asm.label('_main')
         else:
             self.asm.label(node.name)
-
         self.num_extra_locals = len(self.locals) - len(node.args.args)
         self.compile_enter(self.num_extra_locals)
+
+        # Now compile all the statements in the function body
         for statement in node.body:
             self.visit(statement)
 
         if not isinstance(node.body[-1], ast.Return):
+            # Function didn't have explicit return at the end,
+            # compile return now (or exit for "main")
             if self.func == 'main':
                 self.compile_exit(0)
             else:
@@ -219,8 +226,10 @@ class Compiler:
         self.func = None
 
     def compile_enter(self, num_extra_locals=0):
+        # Make space for extra locals (in addition to the arguments)
         for i in range(num_extra_locals):
             self.asm.instr('pushq', '$0')
+        # Use rbp for a stack frame pointer
         self.asm.instr('pushq', '%rbp')
         self.asm.instr('movq', '%rsp', '%rbp')
 
@@ -243,6 +252,7 @@ class Compiler:
         if node.value:
             self.visit(node.value)
         if self.func == 'main':
+            # Returning from main, exit with that return code
             self.compile_exit(None if node.value else 0)
         else:
             if node.value:
@@ -257,14 +267,17 @@ class Compiler:
         return (len(self.locals) - index) * 8 + 8
 
     def visit_Name(self, node):
+        # Only supports locals, not globals
         self.asm.instr('pushq', '{}(%rbp)'.format(self.local_offset(node.id)))
 
     def visit_Assign(self, node):
+        # Only supports assignment of (a single) local variable
         assert len(node.targets) == 1, 'can only assign one variable at a time'
         self.visit(node.value)
         self.asm.instr('popq', '{}(%rbp)'.format(self.local_offset(node.targets[0].id)))
 
     def visit_AugAssign(self, node):
+        # Handles "n += 1" and the like
         self.visit(node.target)
         self.visit(node.value)
         self.visit(node.op)
@@ -343,7 +356,9 @@ class Compiler:
             self.visit(arg)
         self.asm.instr('call', node.func.id)
         if node.args:
+            # Caller cleans up the arguments from the stack
             self.asm.instr('addq', '${}'.format(8 * len(node.args)), '%rsp')
+        # Return value is in rax, so push it on the stack now
         self.asm.instr('pushq', '%rax')
 
     def label(self, slug):
@@ -387,6 +402,7 @@ class Compiler:
         self.compile_comparison('je', 'not_equal')
 
     def visit_If(self, node):
+        # Handles if, elif, and else
         self.visit(node.test)
         self.asm.instr('popq', '%rax')
         self.asm.instr('cmpq', '$0', '%rax')
@@ -404,6 +420,7 @@ class Compiler:
             self.asm.label(label_end)
 
     def visit_While(self, node):
+        # Handles while and break (also used for "for" -- see below)
         while_label = self.label('while')
         break_label = self.label('break')
         self.break_labels.append(break_label)
