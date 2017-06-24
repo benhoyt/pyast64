@@ -6,24 +6,118 @@ import sys
 
 
 class Assembler:
-    def __init__(self, output_file=sys.stdout):
+    """The Assembler takes care of outputting instructions, labels, etc.,
+    as well as a simple peephole optimization to combine sequences of pushes
+    and pops.
+    """
+
+    def __init__(self, output_file=sys.stdout, peephole=True):
         self.output_file = output_file
+        self.peephole = peephole
+        # Current batch of instructions, flushed on label and end of function
+        self.batch = []
+
+    def flush(self):
+        if self.peephole:
+            self.optimize_pushes_pops()
+        for opcode, args in self.batch:
+            print('\t{}\t{}'.format(opcode, ', '.join(str(a) for a in args)),
+                  file=self.output_file)
+        self.batch = []
+
+    def optimize_pushes_pops(self):
+        """This finds runs of push(es) followed by pop(s) and combines
+        them into simpler, faster mov instructions. For example:
+
+        pushq   8(%rbp)
+        pushq   $100
+        popq    %rdx
+        popq    %rax
+
+        Will be turned into:
+
+        movq    $100, %rdx
+        movq    8(%rbp), %rax
+        """
+        state = 'default'
+        optimized = []
+        pushes = 0
+        pops = 0
+
+        # This nested function combines a sequence of pushes and pops
+        def combine():
+            mid = len(optimized) - pops
+            num = min(pushes, pops)
+            moves = []
+            for i in range(num):
+                pop_arg = optimized[mid + i][1][0]
+                push_arg = optimized[mid - i - 1][1][0]
+                if push_arg != pop_arg:
+                    moves.append(('movq', [push_arg, pop_arg]))
+            optimized[mid - num:mid + num] = moves
+
+        # This loop actually finds the sequences
+        for opcode, args in self.batch:
+            if state == 'default':
+                if opcode == 'pushq':
+                    state = 'push'
+                    pushes += 1
+                else:
+                    pushes = 0
+                    pops = 0
+                optimized.append((opcode, args))
+            elif state == 'push':
+                if opcode == 'pushq':
+                    pushes += 1
+                elif opcode == 'popq':
+                    state = 'pop'
+                    pops += 1
+                else:
+                    state = 'default'
+                    pushes = 0
+                    pops = 0
+                optimized.append((opcode, args))
+            elif state == 'pop':
+                if opcode == 'popq':
+                    pops += 1
+                elif opcode == 'pushq':
+                    combine()
+                    state = 'push'
+                    pushes = 1
+                    pops = 0
+                else:
+                    combine()
+                    state = 'default'
+                    pushes = 0
+                    pops = 0
+                optimized.append((opcode, args))
+            else:
+                assert False, 'bad state: {}'.format(state)
+        if state == 'pop':
+            combine()
+        self.batch = optimized
 
     def instr(self, opcode, *args):
-        print('\t{}\t{}'.format(opcode, ', '.join(str(a) for a in args)),
-              file=self.output_file)
+        self.batch.append((opcode, args))
 
     def label(self, name):
+        self.flush()
         print('{}:'.format(name), file=self.output_file)
 
     def directive(self, line):
+        self.flush()
         print(line, file=self.output_file)
 
     def comment(self, text):
+        self.flush()
         print('# {}'.format(text), file=self.output_file)
 
 
 class LocalsVisitor(ast.NodeVisitor):
+    """Recursively visit a FunctionDef node to find all the locals
+    (so we can allocate the right amount of stack space for them).
+    """
+
     def __init__(self):
         self.local_names = []
 
@@ -32,7 +126,8 @@ class LocalsVisitor(ast.NodeVisitor):
             self.local_names.append(name)
 
     def visit_Assign(self, node):
-        assert len(node.targets) == 1, 'can only assign one variable at a time'
+        assert len(node.targets) == 1, \
+            'can only assign one variable at a time'
         self.visit(node.value)
         self.add(node.targets[0].id)
 
@@ -43,9 +138,11 @@ class LocalsVisitor(ast.NodeVisitor):
 
 
 class Compiler:
-    def __init__(self, assembler=None):
+    """The main Python AST -> x86-64 compiler."""
+
+    def __init__(self, assembler=None, peephole=True):
         if assembler is None:
-            assembler = Assembler()
+            assembler = Assembler(peephole=peephole)
         self.asm = assembler
         self.func = None
 
@@ -66,6 +163,7 @@ class Compiler:
 
     def footer(self):
         self.compile_putc()
+        self.asm.flush()
 
     def compile_putc(self):
         self.asm.label('putc')
@@ -83,7 +181,7 @@ class Compiler:
             self.visit(statement)
 
     def visit_FunctionDef(self, node):
-        assert self.func is None, 'nested function definitions not supported'
+        assert self.func is None, 'nested functions not supported'
         assert node.args.vararg is None, '*args not supported'
         assert not node.args.kwonlyargs, 'keyword-only args not supported'
         assert not node.args.kwarg, 'keyword args not supported'
@@ -129,7 +227,8 @@ class Compiler:
     def compile_return(self, num_extra_locals=0):
         self.asm.instr('popq', '%rbp')
         if num_extra_locals > 0:
-            self.asm.instr('leaq', '{}(%rsp),%rsp'.format(num_extra_locals * 8))
+            self.asm.instr('leaq', '{}(%rsp),%rsp'.format(
+                    num_extra_locals * 8))
         self.asm.instr('ret')
 
     def compile_exit(self, return_code):
@@ -152,10 +251,6 @@ class Compiler:
 
     def visit_Num(self, node):
         self.asm.instr('pushq', '${}'.format(node.n))
-
-    def visit_Str(self, node):
-        assert len(node.s) == 1, 'only supports str of length 1'
-        self.asm.instr('pushq', '${}'.format(ord(node.s)))
 
     def local_offset(self, name):
         index = self.locals[name]
@@ -186,6 +281,19 @@ class Compiler:
         self.asm.instr('popq', '%rax')
         self.asm.instr('imulq', '%rdx')
         self.asm.instr('pushq', '%rax')
+
+    def compile_divide(self, push_reg):
+        self.asm.instr('popq', '%rbx')
+        self.asm.instr('popq', '%rax')
+        self.asm.instr('cqo')
+        self.asm.instr('idiv', '%rbx')
+        self.asm.instr('pushq', push_reg)
+
+    def visit_Mod(self, node):
+        self.compile_divide('%rdx')
+
+    def visit_FloorDiv(self, node):
+        self.compile_divide('%rax')
 
     def visit_Add(self, node):
         self.simple_binop('addq')
@@ -356,10 +464,12 @@ class Compiler:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('filename', help='filename to compile')
+    parser.add_argument('-n', '--no-peephole', action='store_true',
+                        help='enable peephole assembler optimizer')
     args = parser.parse_args()
 
     with open(args.filename) as f:
         source = f.read()
     node = ast.parse(source, filename=args.filename)
-    compiler = Compiler()
+    compiler = Compiler(peephole=not args.no_peephole)
     compiler.compile(node)

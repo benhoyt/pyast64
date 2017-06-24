@@ -1,4 +1,5 @@
+# Basic for loop
+
 def main():
     for i in range(10):
         putc('A' + i)
-
