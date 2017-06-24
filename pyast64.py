@@ -1,4 +1,9 @@
-"""Compile a subset of the Python AST to x64-64 assembler."""
+"""Compile a subset of the Python AST to x64-64 assembler.
+
+Read more about it here: http://benhoyt.com/writings/pyast64/
+
+Released under a permissive MIT license (see LICENSE.txt).
+"""
 
 import argparse
 import ast
