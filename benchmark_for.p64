@@ -1,23 +1,10 @@
 # Benchmark a for loop
 
-# python: 7.002s
+# python3.5: 7.002s
 # pyast64: 0.548s (12.7x)
 # pyast64_peephole: 0.236s (29.7x, 2.3x)
-
-def print_num(n):
-    if n == 0:
-        putc(48)
-        return
-    if n < 0:
-        putc(45)
-        n = -n
-    div = n // 10
-    if div != 0:
-        print_num(div)
-    putc(48 + n % 10)
 
 def main():
     sum = 0
     for i in range(100000000):
         sum += i
-    print_num(sum)

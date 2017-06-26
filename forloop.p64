@@ -1,5 +1,8 @@
 # Basic for loop
 
-def main():
+def loop():
     for i in range(10):
         putc(65 + i)
+
+def main():
+    loop()

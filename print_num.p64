@@ -1,0 +1,23 @@
+# Convert a number to decimal and print it
+
+def print_num(n):
+    if n == 0:
+        putc(48)  # '0'
+        return
+    if n < 0:
+        putc(45)  # '-' sign
+        n = -n
+    div = n // 10
+    if div != 0:
+        print_num(div)
+    putc(48 + n % 10)
+
+def newline():
+    putc(10)
+
+def main():
+    print_num(1234)
+    newline()
+    print_num(-404)
+    newline()
+    print_num(0)
