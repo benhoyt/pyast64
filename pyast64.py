@@ -125,21 +125,33 @@ class LocalsVisitor(ast.NodeVisitor):
 
     def __init__(self):
         self.local_names = []
+        self.global_names = []
+        self.function_calls = []
 
     def add(self, name):
-        if name not in self.local_names:
+        if name not in self.local_names and name not in self.global_names:
             self.local_names.append(name)
+
+    def visit_Global(self, node):
+        self.global_names.extend(node.names)
 
     def visit_Assign(self, node):
         assert len(node.targets) == 1, \
             'can only assign one variable at a time'
         self.visit(node.value)
-        self.add(node.targets[0].id)
+        target = node.targets[0]
+        if isinstance(target, ast.Subscript):
+            self.add(target.value.id)
+        else:
+            self.add(target.id)
 
     def visit_For(self, node):
         self.add(node.target.id)
         for statement in node.body:
             self.visit(statement)
+
+    def visit_Call(self, node):
+        self.function_calls.append(node.func.id)
 
 
 class Compiler:
@@ -161,7 +173,8 @@ class Compiler:
         # hard on AST nodes we don't support
         name = node.__class__.__name__
         visit_func = getattr(self, 'visit_' + name, None)
-        assert visit_func is not None, '{} not supported'.format(name)
+        assert visit_func is not None, '{} not supported - node {}'.format(
+                name, ast.dump(node))
         visit_func(node)
 
     def header(self):
@@ -182,7 +195,7 @@ class Compiler:
         self.asm.instr('addq', '$16', '%rsi')
         self.asm.instr('movq', '$1', '%rdx')            # length
         self.asm.instr('syscall')
-        self.compile_return()
+        self.compile_return(has_arrays=False)
 
     def visit_Module(self, node):
         for statement in node.body:
@@ -204,6 +217,9 @@ class Compiler:
         for name in locals_visitor.local_names:
             if name not in self.locals:
                 self.locals[name] = len(self.locals) + 1
+        if 'array' in locals_visitor.function_calls:
+            self.locals['_array_size'] = len(self.locals) + 1
+        self.globals = set(locals_visitor.global_names)
         self.break_labels = []
 
         # Function label and header
@@ -238,7 +254,13 @@ class Compiler:
         self.asm.instr('pushq', '%rbp')
         self.asm.instr('movq', '%rsp', '%rbp')
 
-    def compile_return(self, num_extra_locals=0):
+    def compile_return(self, num_extra_locals=0, has_arrays=None):
+        if has_arrays is None:
+            has_arrays = '_array_size' in self.locals
+        if has_arrays:
+            offset = self.local_offset('_array_size')
+            self.asm.instr('movq', '{}(%rbp)'.format(offset), '%rbx')
+            self.asm.instr('addq', '%rbx', '%rsp')
         self.asm.instr('popq', '%rbp')
         if num_extra_locals > 0:
             self.asm.instr('leaq', '{}(%rsp),%rsp'.format(
@@ -281,8 +303,19 @@ class Compiler:
         assert len(node.targets) == 1, \
             'can only assign one variable at a time'
         self.visit(node.value)
-        offset = self.local_offset(node.targets[0].id)
-        self.asm.instr('popq', '{}(%rbp)'.format(offset))
+        target = node.targets[0]
+        if isinstance(target, ast.Subscript):
+            # array[offset] = value
+            self.visit(target.slice.value)
+            self.asm.instr('popq', '%rax')
+            self.asm.instr('popq', '%rbx')
+            local_offset = self.local_offset(target.value.id)
+            self.asm.instr('movq', '{}(%rbp)'.format(local_offset), '%rdx')
+            self.asm.instr('movq', '%rbx', '(%rdx,%rax,8)')
+        else:
+            # variable = value
+            offset = self.local_offset(node.targets[0].id)
+            self.asm.instr('popq', '{}(%rbp)'.format(offset))
 
     def visit_AugAssign(self, node):
         # Handles "n += 1" and the like
@@ -329,7 +362,8 @@ class Compiler:
         self.visit(node.op)
 
     def visit_UnaryOp(self, node):
-        assert isinstance(node.op, ast.USub), 'only unary minus is supported'
+        assert isinstance(node.op, ast.USub), \
+            'only unary minus is supported, not {}'.format(node.op.__class__.__name__)
         self.visit(ast.Num(n=0))
         self.visit(node.operand)
         self.visit(ast.Sub())
@@ -359,16 +393,32 @@ class Compiler:
             self.visit(value)
             self.visit(node.op)
 
+    def builtin_array(self, args):
+        assert len(args) == 1, 'array(len) expected 1 arg, not {}'.format(len(args))
+        self.visit(args[0])
+        # Allocate array on stack, add size to _array_size, push address
+        self.asm.instr('popq', '%rax')
+        self.asm.instr('shlq', '$3', '%rax')  # len*8 to get size in bytes
+        offset = self.local_offset('_array_size')
+        self.asm.instr('addq', '%rax', '{}(%rbp)'.format(offset))
+        self.asm.instr('subq', '%rax', '%rsp')
+        self.asm.instr('movq', '%rsp', '%rax')
+        self.asm.instr('pushq', '%rax')
+
     def visit_Call(self, node):
         assert not node.keywords, 'keyword args not supported'
-        for arg in node.args:
-            self.visit(arg)
-        self.asm.instr('call', node.func.id)
-        if node.args:
-            # Caller cleans up the arguments from the stack
-            self.asm.instr('addq', '${}'.format(8 * len(node.args)), '%rsp')
-        # Return value is in rax, so push it on the stack now
-        self.asm.instr('pushq', '%rax')
+        builtin = getattr(self, 'builtin_{}'.format(node.func.id), None)
+        if builtin is not None:
+            builtin(node.args)
+        else:
+            for arg in node.args:
+                self.visit(arg)
+            self.asm.instr('call', node.func.id)
+            if node.args:
+                # Caller cleans up the arguments from the stack
+                self.asm.instr('addq', '${}'.format(8 * len(node.args)), '%rsp')
+            # Return value is in rax, so push it on the stack now
+            self.asm.instr('pushq', '%rax')
 
     def label(self, slug):
         label = '{}_{}_{}'.format(self.func, self.label_num, slug)
@@ -487,6 +537,17 @@ class Compiler:
             value=ast.BinOp(left=node.target, op=ast.Add(), right=step),
         )
         self.visit(ast.While(test=test, body=node.body + [incr]))
+
+    def visit_Global(self, node):
+        # Global names are already collected by LocalsVisitor
+        pass
+
+    def visit_Subscript(self, node):
+        self.visit(node.slice.value)
+        self.asm.instr('popq', '%rax')
+        local_offset = self.local_offset(node.value.id)
+        self.asm.instr('movq', '{}(%rbp)'.format(local_offset), '%rdx')
+        self.asm.instr('pushq', '(%rdx,%rax,8)')
 
 
 if __name__ == '__main__':
